@@ -15,7 +15,7 @@ def main():
     # Initialize SparkSession
     spark = SparkSession.builder \
         .appName("ZScore") \
-        .config("spark.sql.streaming.checkpointLocation", "/tmp/chk-moving") \
+        .config("spark.sql.streaming.checkpointLocation", "/opt/spark-apps/Transform/checkpoints/zscore") \
         .config("spark.sql.adaptive.enabled", "false") \
         .getOrCreate()
 
@@ -24,7 +24,7 @@ def main():
     price_topic     = os.getenv("PRICE_TOPIC", "btc-price")
     moving_topic    = os.getenv("MOVING_TOPIC", "btc-price-moving")
     output_topic    = os.getenv("ZSCORE_TOPIC", "btc-price-zscore")
-    checkpoint_loc  = os.getenv("CHECKPOINT_ZSCORE", "/tmp/chk-zscore")
+    checkpoint_loc  = os.getenv("CHECKPOINT_ZSCORE", "/opt/spark-apps/Transform/checkpoints/zscore")
 
     # Read BTC price stream from Kafka and parse JSON
     price_df = spark.readStream \
@@ -42,7 +42,7 @@ def main():
             ) \
             .select("data.symbol", "data.price", "data.event_time") \
             .withColumnRenamed("event_time", "timestamp") \
-            .withWatermark("timestamp", "10 seconds")
+            .withWatermark("timestamp", "1 second")
 
     # Read moving statistics stream from Kafka and parse JSON
     moving_df = spark.readStream \
@@ -59,7 +59,7 @@ def main():
                 ).alias("data")
             ) \
             .select("data.timestamp", "data.symbol", "data.windows") \
-            .withWatermark("timestamp", "10 seconds")
+            .withWatermark("timestamp", "1 second")
 
     # Explode the windows array to get individual window records
     moving_df = moving_df.select(

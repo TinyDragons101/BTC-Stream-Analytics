@@ -12,10 +12,12 @@ def main():
     # Initialize Spark Session
     spark = SparkSession.builder \
         .appName("BTC Price ZScore Loader") \
+        .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:10.1.1,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0") \
+        .config("spark.sql.streaming.checkpointLocation", checkpoint_loc) \
+        .config("spark.sql.adaptive.enabled", "true") \
+        .config("spark.sql.session.timeZone", "UTC") \
         .config("spark.mongodb.connection.uri", "mongodb://mongodb:27017") \
         .config("spark.mongodb.database", "btc_analysis") \
-        .config("spark.sql.streaming.checkpointLocation", checkpoint_loc) \
-        .config("spark.sql.session.timeZone", "UTC") \
         .getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
 
@@ -75,7 +77,7 @@ def main():
     # Start the streaming query
     query = exploded_df.writeStream \
         .foreachBatch(write_to_mongodb) \
-        .option("checkpointLocation", "/tmp/checkpoints/btc-price-zscore") \
+        .option("checkpointLocation", checkpoint_loc) \
         .outputMode("append") \
         .start()
 
