@@ -4,18 +4,17 @@
 
 import os
 from pyspark.sql import SparkSession, functions as F
-import logging
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, TimestampType
+from pyspark.sql.utils import StreamingQueryException
+import time
 
 def main():
-    # Logging
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    logger = logging.getLogger("MovingStatsLogger")
-    logger.info("Starting Moving Stats job...")
 
     # Initialize SparkSession
     spark = SparkSession.builder \
         .appName("MovingStats") \
-        .config("spark.sql.streaming.statefulOperator.checkCorrectness.enabled", "false") \
+        .config("spark.sql.streaming.checkpointLocation", "/tmp/chk-moving") \
+        .config("spark.sql.adaptive.enabled", "false") \
         .getOrCreate()
     
     spark.sparkContext.setLogLevel("INFO")
@@ -26,14 +25,14 @@ def main():
     output_topic = os.getenv("MOVING_TOPIC", "btc-price-moving")
     checkpoint_loc = os.getenv("CHECKPOINT_MOVING", "/tmp/chk-moving")
 
-    # Read streaming data from Kafka
+    # Read from Kafka topic
     df = spark.readStream \
         .format("kafka") \
         .option("kafka.bootstrap.servers", kafka_bootstrap) \
         .option("subscribe", input_topic) \
         .option("startingOffsets", "latest") \
-        .load()
-    
+        .load() \
+        
     # Parse JSON value and extract fields: symbol, price, event_time
     json_df = df.selectExpr("CAST(value AS STRING) AS json_str") \
         .select(
@@ -41,13 +40,12 @@ def main():
                       "symbol STRING, price DOUBLE, event_time TIMESTAMP").alias("data")
         ) \
         .select("data.*") \
-        .withWatermark("event_time", "20 seconds")
-
-    # Log the schema of the parsed DataFrame
-    logger.info("Parsed DataFrame schema: %s", json_df.schema)
-
-    # Define sliding windows for aggregation
-    window_config = [
+        .withColumnRenamed("event_time", "timestamp") \
+        .filter(F.col("symbol").isNotNull() & F.col("price").isNotNull()) \
+        .withWatermark("timestamp", "10 seconds")  # Handle late data up to 10 seconds
+        
+    # Define window sizes
+    windows_config = [
         ("30 seconds", "30s"),
         ("1 minute", "1m"),
         ("5 minutes", "5m"),
@@ -56,45 +54,71 @@ def main():
         ("1 hour", "1h")
     ]
 
-    # Create a list to store window expressions
-    window_exprs = []
-    for w in window_config:
-        window_exprs.append(
-            F.struct(
-                F.lit(w[1]).alias("window"),
-                F.avg("price").over(
-                    F.window("event_time", w[0], w[0])
-                ).alias("avg_price"),
-                F.stddev_samp("price").over(
-                    F.window("event_time", w[0], w[0])
-                ).alias("std_price")
-            )
+    # Create a list to hold DataFrames for each window size
+    windowed_df = []
+
+    # Create a stream for each window size
+    for w in windows_config:
+        windowed_df.append(
+            json_df \
+                .groupBy(
+                    F.col("symbol"),
+                    F.window("timestamp", w[0], "10 seconds").alias("window")
+                ) \
+                .agg(
+                    F.avg("price").alias("avg_price"),
+                    F.stddev("price").alias("std_price")
+                ) \
+                .select(
+                    F.col("symbol"),
+                    F.col("window.start").alias("window_start"),
+                    F.col("window.end").alias("window_end"),
+                    F.lit(w[1]).alias("window"),
+                    F.col("avg_price"),
+                    F.col("std_price")
+                )
         )
 
-    # Calculate all window statistics in one pass
-    result_df = json_df.select(
-        "symbol",
-        F.col("event_time").alias("timestamp"),
-        F.array(*window_exprs).alias("windows")
-    )
+    # Union all windowed DataFrames
+    final_df = windowed_df[0]
+    for other in windowed_df[1:]:
+        final_df = final_df.union(other)
 
-    # Convert to JSON string for Kafka output
-    out_df = result_df.selectExpr("to_json(struct(timestamp, symbol, windows)) AS value")
-
-    # Reduce partitions to avoid creating too many Kafka tasks
-    out_df = out_df.coalesce(2)
-
-    kafka_query = out_df.writeStream \
-        .format("kafka") \
-        .option("kafka.bootstrap.servers", kafka_bootstrap) \
-        .option("topic", output_topic) \
-        .option("checkpointLocation", checkpoint_loc) \
-        .outputMode("complete") \
-        .trigger(processingTime="5 seconds") \
-        .start()
-
-    # Wait for all queries to finish
-    spark.streams.awaitAnyTermination()
-
+    # Process and write to Kafka
+    final_df.writeStream \
+        .foreachBatch(lambda batch_df, batch_id: (
+            batch_df \
+                .groupBy("symbol", "window_start") \
+                .agg(
+                    F.collect_list(
+                        F.struct(
+                            F.col("window"),
+                            F.col("avg_price"),
+                            F.col("std_price"),
+                            # F.date_format(F.col("window_end"), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").alias("end_time")
+                        )
+                    ).alias("windows")
+                ) \
+                .select(
+                    F.col("symbol"),
+                    F.to_json(
+                        F.struct(
+                            F.date_format(F.col("window_start"), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").alias("timestamp"),
+                            F.col("symbol"),
+                            F.col("windows")
+                        )
+                    ).alias("value")
+                ) \
+                .write \
+                .format("kafka") \
+                .option("kafka.bootstrap.servers", kafka_bootstrap) \
+                .option("topic", output_topic) \
+                .save()
+        ) if not batch_df.rdd.isEmpty() else None) \
+        .outputMode("update") \
+        .trigger(processingTime="10 seconds") \
+        .start() \
+        .awaitTermination()
+        
 if __name__ == "__main__":
     main()

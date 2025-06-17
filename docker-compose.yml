@@ -124,6 +124,43 @@ services:
     depends_on: [spark-moving, kafka, spark-worker-2]
     networks: [bigdata-net]
 
+  # spark-worker-3:
+  #   image: bitnami/spark:latest
+  #   container_name: lab04-spark-worker-3
+  #   user: root
+  #   working_dir: "/opt/spark-apps"
+  #   volumes:
+  #     - ./:/opt/spark-apps      # mount toàn bộ project vào spark-apps
+  #   environment:
+  #     SPARK_MODE: worker
+  #     SPARK_MASTER_URL: spark://spark-master:7077
+  #     HOME: /root
+  #   depends_on: [spark-master, kafka]
+  #   networks: [bigdata-net]
+
+  # mongodb:
+  #   image: mongo:latest
+  #   container_name: lab04-mongodb
+  #   ports:
+  #     - "27017:27017"
+  #   networks: [bigdata-net]
+
+  # spark-loader:
+  #   image: bitnami/spark:latest
+  #   container_name: lab04-spark-loader
+  #   working_dir: /opt/spark-apps/Load
+  #   volumes:
+  #     - ./:/opt/spark-apps
+  #   command: >
+  #     spark-submit
+  #       --master spark://spark-master:7077
+  #       --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.0,org.mongodb.spark:mongo-spark-connector_2.13:10.1.1
+  #       --executor-memory 512m
+  #       --total-executor-cores 1
+  #       btc_loader.py
+  #   depends_on: [spark-zscore, mongodb]
+  #   networks: [bigdata-net]
+
 networks:
   bigdata-net:
     driver: bridge
