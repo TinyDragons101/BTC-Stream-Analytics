@@ -50,50 +50,38 @@ def main():
 
     # Define sliding windows for aggregation
     windows = ["30 seconds", "1 minute", "5 minutes", "15 minutes", "30 minutes", "1 hour"]
-    window_labels = ["30s", "1m", "5m", "15m", "30m", "1h"]
     agg_dfs = []
 
     # For each window size, compute average and standard deviation
-    for w, label in zip(windows, window_labels):
+    for w in windows:
         win_df = (
             json_df
-              .groupBy("symbol", F.window("event_time", w, w).alias("window"))
+              .groupBy(F.window("event_time", w, w).alias("window"))
               .agg(
                   F.avg("price").alias("avg_price"),
                   F.stddev_samp("price").alias("std_price")
               )
-              .select(
-                  "symbol",
-                  F.col("window.end").alias("timestamp"),
-                  F.lit(label).alias("window"),
+              # Select desired output schema: timestamp end, window label, metrics
+              .selectExpr(
+                  "window.end AS timestamp",
+                  f"'{w}' AS window",
                   "avg_price",
                   "std_price"
               )
         )
         agg_dfs.append(win_df)
 
-    # Union all windowed DataFrames
+    # Union all windowed DataFrames into one
     result_df = agg_dfs[0]
     for other in agg_dfs[1:]:
         result_df = result_df.union(other)
 
-    # Group by symbol and timestamp to create windows array
-    final_df = result_df.groupBy("symbol", "timestamp") \
-        .agg(
-            F.collect_list(
-                F.struct(
-                    "window",
-                    "avg_price",
-                    "std_price"
-                )
-            ).alias("windows")
-        )
+    # Giảm số partition để tránh tạo hàng trăm Kafka tasks
+    result_df = result_df.coalesce(2)
 
-    # Convert to JSON string for Kafka output
-    out_df = final_df.selectExpr("to_json(struct(timestamp, symbol, windows)) AS value")
+    # Convert struct to JSON string for Kafka output
+    out_df = result_df.selectExpr("to_json(struct(timestamp, window, avg_price, std_price)) AS value")
 
-    # Reduce partitions to avoid creating too many Kafka tasks
-    out_df = out_df.coalesce(2)
 
     kafka_query = out_df.writeStream \
         .format("kafka") \
@@ -104,7 +92,7 @@ def main():
         .trigger(processingTime="5 seconds") \
         .start()
 
-    # Wait for all queries to finish
+    # Đợi tất cả query chạy xong
     spark.streams.awaitAnyTermination()
     
 
