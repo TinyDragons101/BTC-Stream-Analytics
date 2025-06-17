@@ -15,6 +15,8 @@ def main():
     # Initialize SparkSession
     spark = SparkSession.builder \
         .appName("ZScore") \
+        .config("spark.sql.streaming.checkpointLocation", "/tmp/chk-moving") \
+        .config("spark.sql.adaptive.enabled", "false") \
         .getOrCreate()
 
     # Environment variable settings
@@ -91,21 +93,21 @@ def main():
 
     # Group by timestamp and symbol to create the nested array structure
     final_df = zscore_df \
-        .groupBy("timestamp", "symbol") \
+        .groupBy(price_df.timestamp, price_df.symbol) \
         .agg(
             F.collect_list(
                 F.struct(
-                    F.col("window"),
-                    F.col("zscore_price")
+                    F.col("window").alias("window"),
+                    F.col("zscore_price").alias("zscore_price")
                 )
             ).alias("zscores")
         ) \
         .select(
             F.to_json(
                 F.struct(
-                    F.date_format("timestamp", "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").alias("timestamp"),
-                    "symbol",
-                    "zscores"
+                    F.date_format(price_df.timestamp, "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").alias("timestamp"),
+                    price_df.symbol.alias("symbol"),
+                    F.col("zscores").alias("zscores")
                 )
             ).alias("value")
         )

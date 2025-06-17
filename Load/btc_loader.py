@@ -1,63 +1,85 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, window, current_timestamp
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType, TimestampType
+from pyspark.sql.functions import from_json, col, explode
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, ArrayType
+import os
 
-# Initialize Spark Session
-spark = SparkSession.builder \
-    .appName("BTC Price ZScore Loader") \
-    .config("spark.mongodb.connection.uri", "mongodb://mongodb:27017") \
-    .config("spark.mongodb.database", "btc_analysis") \
-    .getOrCreate()
+def main():    
+    # Read Kafka connection and topic settings from environment variables
+    kafka_bootstrap = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
+    checkpoint_loc = os.getenv("CHECKPOINT_LOADER", "/tmp/chk-loader")
+    input_topic = os.getenv("ZSCORE_TOPIC", "btc-price-zscore")
+    
+    # Initialize Spark Session
+    spark = SparkSession.builder \
+        .appName("BTC Price ZScore Loader") \
+        .config("spark.mongodb.connection.uri", "mongodb://mongodb:27017") \
+        .config("spark.mongodb.database", "btc_analysis") \
+        .config("spark.sql.streaming.checkpointLocation", checkpoint_loc) \
+        .config("spark.sql.session.timeZone", "UTC") \
+        .getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
 
-# Define schema for the incoming Kafka messages
-schema = StructType([
-    StructField("timestamp", TimestampType(), True),
-    StructField("price", DoubleType(), True),
-    StructField("zscore", DoubleType(), True),
-    StructField("window", StringType(), True)
-])
+    # Define the schema for the incoming Kafka messages
+    zscore_schema = StructType([
+        StructField("timestamp", StringType(), True),
+        StructField("symbol", StringType(), True),
+        StructField("zscores", ArrayType(
+            StructType([
+                StructField("window", StringType(), True),
+                StructField("zscore_price", DoubleType(), True)
+            ])
+        ), True)
+    ])
 
-# Read from Kafka
-df = spark.readStream \
-    .format("kafka") \
-    .option("kafka.bootstrap.servers", "kafka:9092") \
-    .option("subscribe", "btc-price-zscore") \
-    .option("startingOffsets", "latest") \
-    .load()
+    # Read from Kafka
+    kafka_df = spark.readStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", kafka_bootstrap) \
+        .option("subscribe", input_topic) \
+        .option("startingOffsets", "latest") \
+        .option("failOnDataLoss", "false") \
+        .load()
 
-# Parse the JSON value and add processing timestamp
-parsed_df = df.select(
-    from_json(col("value").cast("string"), schema).alias("data"),
-    current_timestamp().alias("processing_timestamp")
-).select("data.*", "processing_timestamp")
+    # Parse and transform the data
+    parsed_df = kafka_df \
+        .select(from_json(col("value").cast("string"), zscore_schema).alias("data")) \
+        .select("data.*")
 
-# Define window sizes
-window_sizes = ["30s", "1m", "5m", "15m", "30m", "1h"]
-
-# Create a stream for each window size
-for window_size in window_sizes:
-    windowed_df = parsed_df \
-        .withWatermark("timestamp", "10 seconds") \
-        .groupBy(window("timestamp", window_size)) \
-        .agg(
-            {"price": "avg", "zscore": "avg"}
-        ) \
+    exploded_df = parsed_df \
+        .withColumn("zscore", explode(col("zscores"))) \
         .select(
-            col("window.start").alias("window_start"),
-            col("window.end").alias("window_end"),
-            col("avg(price)").alias("avg_price"),
-            col("avg(zscore)").alias("avg_zscore")
+            col("timestamp"),
+            col("symbol"),
+            col("zscore.window").alias("window"),
+            col("zscore.zscore_price").alias("zscore_price")
         )
 
-    # Write to MongoDB
-    query = windowed_df.writeStream \
-        .format("mongodb") \
-        .option("spark.mongodb.connection.uri", "mongodb://mongodb:27017") \
-        .option("spark.mongodb.database", "btc_analysis") \
-        .option("spark.mongodb.collection", f"btc-price-zscore-{window_size}") \
-        .option("checkpointLocation", f"/tmp/checkpoints/btc-price-zscore-{window_size}") \
+    # Write to MongoDB for each window size
+    window_sizes = ['30s', '1m', '5m', '15m', '30m', '1h']
+    
+    def write_to_mongodb(df, epoch_id):
+        try:
+            for window_size in window_sizes:
+                window_df = df.filter(col("window") == window_size)
+                if window_df.count() > 0:
+                    window_df = window_df.withColumn("_id", col("timestamp"))
+                    window_df.write \
+                        .format("mongo") \
+                        .mode("append") \
+                        .option("uri", f"mongodb://mongodb:27017/btc_analysis.btc-price-zscore-{window_size}") \
+                        .save()
+                    print(f"[Epoch {epoch_id}] Wrote data to btc-price-zscore-{window_size}")
+        except Exception as e:
+            print(f"[Epoch {epoch_id}] ERROR: {e}")
+
+    # Start the streaming query
+    query = exploded_df.writeStream \
+        .foreachBatch(write_to_mongodb) \
+        .option("checkpointLocation", "/tmp/checkpoints/btc-price-zscore") \
         .outputMode("append") \
         .start()
 
-# Wait for the termination of all streams
-spark.streams.awaitAnyTermination()
+    query.awaitTermination()
+
+if __name__ == "__main__":
+    main()
