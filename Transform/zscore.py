@@ -6,7 +6,6 @@ import os
 from pyspark.sql import SparkSession, functions as F
 import logging
 
-
 def main():
     # Logging setup
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s- %(message)s')
