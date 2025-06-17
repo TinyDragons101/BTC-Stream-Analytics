@@ -102,6 +102,8 @@ services:
       spark-submit
         --master spark://spark-master:7077
         --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.0
+        --executor-memory 512m
+        --total-executor-cores 2
         moving_stats.py
     depends_on: [spark-worker-1, kafka]
     networks: [bigdata-net]
@@ -116,6 +118,8 @@ services:
       spark-submit
         --master spark://spark-master:7077
         --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.0
+        --executor-memory 512m
+        --total-executor-cores 2
         zscore.py
     depends_on: [spark-moving, kafka, spark-worker-2]
     networks: [bigdata-net]
@@ -130,7 +134,7 @@ services:
       - mongodb-data:/data/db
 
   spark-loader:
-    image: bitnami/spark:3.5.5
+    image: bitnami/spark:latest
     container_name: lab04-spark-loader
     working_dir: /opt/spark-apps/Load
     volumes:
@@ -139,6 +143,8 @@ services:
       spark-submit
         --master spark://spark-master:7077
         --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.mongodb.spark:mongo-spark-connector_2.12:10.1.1
+        --executor-memory 512m
+        --total-executor-cores 2
         btc_loader.py
     depends_on: [spark-zscore, mongodb]
     networks: [bigdata-net]

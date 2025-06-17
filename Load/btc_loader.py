@@ -22,7 +22,7 @@ def main():
     spark.sparkContext.setLogLevel("WARN")
 
     # Define the schema for the incoming Kafka messages
-    zscore_schema = StructType([
+    schema = StructType([
         StructField("timestamp", StringType(), True),
         StructField("symbol", StringType(), True),
         StructField("zscores", ArrayType(
@@ -34,20 +34,21 @@ def main():
     ])
 
     # Read from Kafka
-    kafka_df = spark.readStream \
+    read_df = spark.readStream \
         .format("kafka") \
         .option("kafka.bootstrap.servers", kafka_bootstrap) \
         .option("subscribe", input_topic) \
         .option("startingOffsets", "latest") \
         .option("failOnDataLoss", "false") \
+        .option("maxOffsetsPerTrigger", 1000) \
         .load()
 
     # Parse and transform the data
-    parsed_df = kafka_df \
-        .select(from_json(col("value").cast("string"), zscore_schema).alias("data")) \
+    transform_df = read_df \
+        .select(from_json(col("value").cast("string"), schema).alias("data")) \
         .select("data.*")
 
-    exploded_df = parsed_df \
+    exploded_df = transform_df \
         .withColumn("zscore", explode(col("zscores"))) \
         .select(
             col("timestamp"),
@@ -58,25 +59,23 @@ def main():
 
     # Write to MongoDB for each window size
     window_sizes = ['30s', '1m', '5m', '15m', '30m', '1h']
-    
-    def write_to_mongodb(df, epoch_id):
-        try:
-            for window_size in window_sizes:
-                window_df = df.filter(col("window") == window_size)
-                if window_df.count() > 0:
-                    window_df = window_df.withColumn("_id", col("timestamp"))
-                    window_df.write \
-                        .format("mongo") \
-                        .mode("append") \
-                        .option("uri", f"mongodb://mongodb:27017/btc_analysis.btc-price-zscore-{window_size}") \
-                        .save()
-                    print(f"[Epoch {epoch_id}] Wrote data to btc-price-zscore-{window_size}")
-        except Exception as e:
-            print(f"[Epoch {epoch_id}] ERROR: {e}")
 
     # Start the streaming query
     query = exploded_df.writeStream \
-        .foreachBatch(write_to_mongodb) \
+        .foreachBatch(
+            lambda df, epoch_id: [
+                (
+                    window_df.write
+                        .format("mongo")
+                        .mode("append")
+                        .option("uri", f"mongodb://mongodb:27017/btc_analysis.btc-price-zscore-{window_size}")
+                        .save(),
+                )
+                for window_size in window_sizes
+                for window_df in [df.filter(col("window") == window_size).withColumn("_id", col("timestamp"))]
+                if window_df.count() > 0
+            ]
+        ) \
         .option("checkpointLocation", checkpoint_loc) \
         .outputMode("append") \
         .start()
