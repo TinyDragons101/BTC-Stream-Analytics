@@ -1,0 +1,129 @@
+services:
+  producer:
+    image: python:3.9-slim
+    container_name: kafka-lab04-producer
+    networks:
+      - bigdata-net
+    # mount toàn bộ project vào /app
+    working_dir: /app
+    volumes:
+      - ./:/app
+    command: >
+      bash -c "pip install --no-cache-dir confluent-kafka requests &&
+               python Extract/btc_producer.py"
+    depends_on:
+      - kafka
+
+  zookeeper:
+    image: bitnami/zookeeper:latest
+    container_name: kafka-lab04-zookeepers
+    environment:
+      ALLOW_ANONYMOUS_LOGIN: "yes"
+    ports: ["2181:2181"]
+    networks: [bigdata-net]
+
+  kafka:
+    image: bitnami/kafka:3.5.1
+    container_name: kafka-lab04-kafka
+    depends_on: [zookeeper]
+    environment:
+      KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_CFG_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+    ports: ["9092:9092"]
+    networks: [bigdata-net]
+  
+  init-kafka:
+    image: bitnami/kafka:3.5.1
+    container_name: kafka-init
+    depends_on:
+      - kafka
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "
+      sleep 10 &&
+      kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic btc-price --partitions 1 --replication-factor 1 &&
+      kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic btc-price-moving --partitions 1 --replication-factor 1 &&
+      kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic btc-price-zscore --partitions 1 --replication-factor 1
+      "
+    networks: [bigdata-net]
+
+  spark-master:
+    image: bitnami/spark:latest
+    container_name: lab04-spark-master
+    environment:
+      SPARK_MODE: master
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    depends_on: [kafka]
+    networks: [bigdata-net]
+
+  spark-worker-1:
+    image: bitnami/spark:latest
+    container_name: lab04-spark-worker-1
+    user: root
+    working_dir: "/opt/spark-apps"
+    volumes:
+      - ./:/opt/spark-apps      # mount toàn bộ project vào spark-apps
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      HOME: /root
+    depends_on: [spark-master, kafka]
+    networks: [bigdata-net]
+
+  spark-worker-2:
+    image: bitnami/spark:latest
+    container_name: lab04-spark-worker-2
+    user: root
+    working_dir: "/opt/spark-apps"
+    volumes:
+      - ./:/opt/spark-apps      # mount toàn bộ project vào spark-apps
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      HOME: /root
+    depends_on: [spark-master, kafka]
+    networks: [bigdata-net]
+
+  spark-moving:
+    image: bitnami/spark:latest
+    container_name: lab04-spark-moving
+    working_dir: /opt/spark-apps/Transform
+    volumes:
+      - ./:/opt/spark-apps
+    command: >
+      spark-submit
+        --master spark://spark-master:7077
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.0
+        --executor-memory 512m
+        --total-executor-cores 1
+        moving_stats.py
+    depends_on: [spark-worker-1, kafka]
+    networks: [bigdata-net]
+
+  spark-zscore:
+    image: bitnami/spark:latest
+    container_name: lab04-spark-zscore
+    working_dir: /opt/spark-apps/Transform
+    volumes:
+      - ./:/opt/spark-apps
+    command: >
+      spark-submit
+        --master spark://spark-master:7077
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.0
+        --executor-memory 512m
+        --total-executor-cores 1
+        zscore.py
+    depends_on: [spark-moving, kafka, spark-worker-2]
+    networks: [bigdata-net]
+
+networks:
+  bigdata-net:
+    driver: bridge
